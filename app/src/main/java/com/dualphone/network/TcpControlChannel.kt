@@ -1,6 +1,6 @@
 /**
- * TCP 控制通道：Host 作为 ServerSocket 监听，Companion 作为客户端连接。
- * 一行一条 JSON；断线后指数退避重连；发送队列在重连后尽力重放。
+ * TCP 控制通道：转发端 ServerSocket 监听，接收端连接。
+ * 接收端若尚无对端 IP，会等待 discovery / 手动填写，不再立刻抛错退出。
  */
 package com.dualphone.network
 
@@ -33,7 +33,6 @@ class TcpControlChannel(
     private val role: DeviceRole,
     private val deviceName: String,
     private val onMessage: (Msg) -> Unit,
-    /** 为 false 时不直接改 AppBus 连接态（由自动模式统一汇报） */
     private val announceState: Boolean = true,
     private val onLinkChanged: ((connected: Boolean, peer: String?) -> Unit)? = null,
 ) {
@@ -52,7 +51,6 @@ class TcpControlChannel(
 
     fun currentPeer(): String? = peerIp
 
-    /** Companion 发现到 Host IP 后动态更新，供重连使用 */
     fun setPeerIp(ip: String) {
         if (ip.isBlank()) return
         peerIp = ip
@@ -73,15 +71,20 @@ class TcpControlChannel(
                         )
                     }
                     AppBus.log("TCP 连接中… role=$role peer=$peerIp")
-                    val sock = if (role == DeviceRole.HOST) acceptClient() else connectClient()
+                    val sock = if (role == DeviceRole.HOST) {
+                        acceptClient()
+                    } else {
+                        waitAndConnectClient()
+                    }
                     socket = sock
                     writer = BufferedWriter(OutputStreamWriter(sock.getOutputStream(), Charsets.UTF_8))
                     linked.set(true)
                     val peerAddr = sock.inetAddress?.hostAddress ?: peerIp
                     peerIp = peerAddr
                     if (announceState) {
-                        AppBus.setConn(ConnState.CONNECTED, peerAddr)
+                        AppBus.setConn(ConnState.CONNECTED, "局域网 $peerAddr")
                     }
+                    AppBus.clearLastError()
                     AppBus.log("TCP 已连接 ${sock.remoteSocketAddress}")
                     onLinkChanged?.invoke(true, peerAddr)
                     backoff = 1000L
@@ -128,7 +131,9 @@ class TcpControlChannel(
                         pingJob.cancel()
                     }
                 } catch (e: Exception) {
-                    AppBus.log("TCP 断开: ${e.message}", "W")
+                    val m = e.message ?: e.javaClass.simpleName
+                    AppBus.log("TCP 断开: $m", "W")
+                    if (announceState) AppBus.setLastError("局域网: $m")
                 } finally {
                     val was = linked.getAndSet(false)
                     closeQuietly()
@@ -138,7 +143,7 @@ class TcpControlChannel(
                 if (!running.get()) break
                 if (announceState) AppBus.setConn(ConnState.RECONNECTING)
                 delay(backoff)
-                backoff = (backoff * 2).coerceAtMost(30_000L)
+                backoff = (backoff * 2).coerceAtMost(15_000L)
             }
         }
     }
@@ -152,7 +157,6 @@ class TcpControlChannel(
         if (announceState) AppBus.setConn(ConnState.DISCONNECTED)
     }
 
-    /** 入队发送；重要消息同时进重放队列（断线后补发） */
     fun enqueue(msg: Msg, reliable: Boolean = false) {
         val line = ProtocolCodec.encode(msg)
         sendQueue.offer(line)
@@ -196,26 +200,48 @@ class TcpControlChannel(
         ss.reuseAddress = true
         ss.bind(InetSocketAddress(Ports.TCP_CONTROL))
         serverSocket = ss
-        AppBus.log("Host 监听 TCP :${Ports.TCP_CONTROL}")
-        ss.soTimeout = 60_000
+        AppBus.log("转发端监听 TCP :${Ports.TCP_CONTROL}")
+        // 较短超时以便 stop() 时能退出；外层循环会重试
+        ss.soTimeout = 30_000
         val sock = ss.accept()
         sock.tcpNoDelay = true
+        sock.keepAlive = true
         peerIp = sock.inetAddress.hostAddress
         return sock
     }
 
-    private fun connectClient(): Socket {
-        val ip = peerIp ?: throw IllegalStateException("Companion 需要 peer IP")
-        val sock = Socket()
-        sock.tcpNoDelay = true
-        sock.connect(InetSocketAddress(ip, Ports.TCP_CONTROL), 8_000)
-        return sock
+    /** 接收端：没有 IP 就等，有了再连；避免空 IP 立刻抛错把整个通道打成失败 */
+    private suspend fun waitAndConnectClient(): Socket {
+        while (running.get()) {
+            val ip = peerIp
+            if (!ip.isNullOrBlank()) {
+                AppBus.log("接收端连接 $ip:${Ports.TCP_CONTROL}")
+                val sock = Socket()
+                sock.tcpNoDelay = true
+                sock.keepAlive = true
+                sock.connect(InetSocketAddress(ip, Ports.TCP_CONTROL), 8_000)
+                return sock
+            }
+            if (announceState) AppBus.setConn(ConnState.DISCOVERING)
+            AppBus.log("接收端等待发现转发端 IP…")
+            delay(800)
+        }
+        throw IllegalStateException("已停止")
     }
 
     private fun closeQuietly() {
-        try { writer?.close() } catch (_: Exception) {}
-        try { socket?.close() } catch (_: Exception) {}
-        try { serverSocket?.close() } catch (_: Exception) {}
+        try {
+            writer?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            socket?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            serverSocket?.close()
+        } catch (_: Exception) {
+        }
         writer = null
         socket = null
         serverSocket = null

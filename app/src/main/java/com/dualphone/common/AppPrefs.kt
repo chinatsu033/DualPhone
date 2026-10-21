@@ -1,5 +1,5 @@
 /**
- * 简单 SharedPreferences 封装：角色、对端 IP、连接模式、配对码、功能开关。
+ * SharedPreferences：角色、对端 IP、连接模式、配对码、功能开关。
  */
 package com.dualphone.common
 
@@ -21,7 +21,7 @@ class AppPrefs(context: Context) {
 
     var peerIp: String
         get() = sp.getString(Prefs.KEY_PEER_IP, "") ?: ""
-        set(v) = sp.edit().putString(Prefs.KEY_PEER_IP, v).apply()
+        set(v) = sp.edit().putString(Prefs.KEY_PEER_IP, v.trim()).apply()
 
     var deviceName: String
         get() = sp.getString(Prefs.KEY_DEVICE_NAME, android.os.Build.MODEL) ?: android.os.Build.MODEL
@@ -53,7 +53,10 @@ class AppPrefs(context: Context) {
 
     var pairingCode: String
         get() = (sp.getString(Prefs.KEY_PAIRING_CODE, "") ?: "").uppercase()
-        set(v) = sp.edit().putString(Prefs.KEY_PAIRING_CODE, v.uppercase().trim()).apply()
+        set(v) = sp.edit().putString(
+            Prefs.KEY_PAIRING_CODE,
+            v.uppercase().filter { it.isLetterOrDigit() }.take(6),
+        ).apply()
 
     var relayUrl: String
         get() {
@@ -62,7 +65,6 @@ class AppPrefs(context: Context) {
         }
         set(v) = sp.edit().putString(Prefs.KEY_RELAY_URL, v.trim()).apply()
 
-    /** 生成 6 位配对码（去掉易混字符） */
     fun generatePairingCode(): String {
         val alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
         val code = buildString {
@@ -72,9 +74,21 @@ class AppPrefs(context: Context) {
         return code
     }
 
-    /** 确保有 6 位配对码（自动/中继模式需要） */
-    fun ensurePairingCode(): String {
+    /**
+     * 转发端可自动生成码；接收端禁止静默生成（否则两边进不同房间，中继永远连不上）。
+     * @return 有效 6 位码，或 null（接收端尚未填写）
+     */
+    fun ensurePairingCodeForRole(): String? {
         if (pairingCode.length == 6) return pairingCode
-        return generatePairingCode()
+        return if (role == DeviceRole.HOST) {
+            generatePairingCode()
+        } else {
+            null
+        }
+    }
+
+    @Deprecated("Use ensurePairingCodeForRole", ReplaceWith("ensurePairingCodeForRole()"))
+    fun ensurePairingCode(): String {
+        return ensurePairingCodeForRole() ?: generatePairingCode()
     }
 }

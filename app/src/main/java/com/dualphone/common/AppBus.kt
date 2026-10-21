@@ -1,6 +1,5 @@
 /**
- * 进程内事件总线：日志、连接状态、来电、通知列表更新。
- * 用 SharedFlow，UI 与服务均可订阅。
+ * 进程内事件总线：日志、连接状态、最近错误、来电、通知列表。
  */
 package com.dualphone.common
 
@@ -25,6 +24,9 @@ object AppBus {
     private val _peer = MutableStateFlow<String?>(null)
     val peer: StateFlow<String?> = _peer.asStateFlow()
 
+    private val _lastError = MutableStateFlow<String?>(null)
+    val lastError: StateFlow<String?> = _lastError.asStateFlow()
+
     private val _messages = MutableSharedFlow<Msg>(extraBufferCapacity = 64)
     val messages: SharedFlow<Msg> = _messages.asSharedFlow()
 
@@ -40,7 +42,21 @@ object AppBus {
     fun setConn(state: ConnState, peerAddr: String? = _peer.value) {
         _conn.value = state
         if (peerAddr != null) _peer.value = peerAddr
-        if (state == ConnState.DISCONNECTED) _peer.value = null
+        if (state == ConnState.DISCONNECTED) {
+            // 保留 peer 文案到下一次连接说明；错误单独管
+        }
+        if (state == ConnState.CONNECTED) {
+            _lastError.value = null
+        }
+    }
+
+    fun setLastError(text: String?) {
+        _lastError.value = text
+        if (!text.isNullOrBlank()) log(text, "E")
+    }
+
+    fun clearLastError() {
+        _lastError.value = null
     }
 
     fun log(text: String, level: String = "I") {

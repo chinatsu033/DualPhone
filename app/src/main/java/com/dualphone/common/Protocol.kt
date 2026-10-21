@@ -44,7 +44,7 @@ object AudioFormat {
 
 /** 局域网探测等待时长（Companion 自动模式） */
 object AutoConnect {
-    const val LAN_TRY_MS = 5_000L
+    const val LAN_TRY_MS = 10_000L
     const val LAN_FAILOVER_GRACE_MS = 3_000L
     const val LAN_UPGRADE_INTERVAL_MS = 8_000L
 }
@@ -126,6 +126,8 @@ sealed class Msg {
         val role: String,
         val name: String,
         val tcpPort: Int = Ports.TCP_CONTROL,
+        val pairingCode: String = "",
+        val ip: String = "",
         override val type: String = "discover",
     ) : Msg()
 }

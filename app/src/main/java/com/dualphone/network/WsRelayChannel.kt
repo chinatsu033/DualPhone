@@ -1,7 +1,7 @@
 /**
- * 云中继通道：经 WSS 连接 Cloudflare Worker / 自建 Node。
- * 文本帧 = 控制 JSON（与 TCP 相同）；二进制帧 = DPAU 音频包。
- * 配对码 6 位；断线指数退避重连；可靠消息入重放队列。
+ * 云中继：WSS 连 Cloudflare Worker。
+ * 文本=控制 JSON；二进制=DPAU 音频。
+ * 「链路已开」≠「对端已入房」：看 relay_status.ready。
  */
 package com.dualphone.network
 
@@ -23,6 +23,7 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
+import org.json.JSONObject
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -38,10 +39,11 @@ class WsRelayChannel(
     private val onMessage: (Msg) -> Unit,
     private val onAudioFrame: ((ByteArray) -> Unit)? = null,
     private val announceState: Boolean = true,
-    private val onLinkChanged: ((connected: Boolean) -> Unit)? = null,
+    private val onLinkChanged: ((connected: Boolean, peerReady: Boolean) -> Unit)? = null,
 ) {
     private val running = AtomicBoolean(false)
     private val linked = AtomicBoolean(false)
+    private val peerReady = AtomicBoolean(false)
     private val sendQueue = ConcurrentLinkedQueue<String>()
     private val replayQueue = ConcurrentLinkedQueue<String>()
     private val audioSendQueue = ConcurrentLinkedQueue<ByteArray>()
@@ -53,12 +55,26 @@ class WsRelayChannel(
         .pingInterval(20, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .connectTimeout(15, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .build()
 
-    fun isConnected(): Boolean = linked.get()
+    /** 已与中继建立 WSS */
+    fun isLinked(): Boolean = linked.get()
+
+    /** 房间内双方都在（可互发业务消息） */
+    fun isPeerReady(): Boolean = peerReady.get()
+
+    /** 兼容旧调用：对端就绪才算真正连通 */
+    fun isConnected(): Boolean = linked.get() && peerReady.get()
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
+        if (roomCode.length != 6) {
+            AppBus.setLastError("配对码必须是 6 位，当前「$roomCode」")
+            AppBus.log("中继未启动：配对码无效「$roomCode」", "E")
+            running.set(false)
+            return
+        }
         loopJob = scope.launch(Dispatchers.IO) {
             var backoff = 1000L
             while (isActive && running.get()) {
@@ -66,27 +82,30 @@ class WsRelayChannel(
                     if (announceState) {
                         AppBus.setConn(
                             if (backoff > 1000) ConnState.RECONNECTING else ConnState.CONNECTING,
-                            "relay:$roomCode",
+                            "中继 $roomCode",
                         )
                     }
                     AppBus.log("中继连接中… room=$roomCode role=$role")
                     val opened = connectOnce()
-                    if (!opened) throw IllegalStateException("websocket open failed")
+                    if (!opened) throw IllegalStateException("WebSocket 握手失败")
                     backoff = 1000L
                     while (isActive && running.get() && socketRef.get() != null) {
                         delay(200)
                     }
                 } catch (e: Exception) {
-                    AppBus.log("中继断开: ${e.message}", "W")
+                    val m = e.message ?: e.javaClass.simpleName
+                    AppBus.log("中继断开: $m", "W")
+                    if (announceState) AppBus.setLastError("云中继: $m")
                 } finally {
                     writerJob?.cancel()
                     socketRef.getAndSet(null)?.cancel()
                     val was = linked.getAndSet(false)
-                    if (was) onLinkChanged?.invoke(false)
+                    peerReady.set(false)
+                    if (was) onLinkChanged?.invoke(false, false)
                     if (announceState) AppBus.setConn(ConnState.DISCONNECTED)
                 }
                 if (!running.get()) break
-                if (announceState) AppBus.setConn(ConnState.RECONNECTING, "relay:$roomCode")
+                if (announceState) AppBus.setConn(ConnState.RECONNECTING, "中继 $roomCode")
                 delay(backoff)
                 backoff = (backoff * 2).coerceAtMost(30_000L)
             }
@@ -99,7 +118,8 @@ class WsRelayChannel(
         writerJob?.cancel()
         socketRef.getAndSet(null)?.close(1000, "stop")
         val was = linked.getAndSet(false)
-        if (was) onLinkChanged?.invoke(false)
+        peerReady.set(false)
+        if (was) onLinkChanged?.invoke(false, false)
         if (announceState) AppBus.setConn(ConnState.DISCONNECTED)
     }
 
@@ -112,7 +132,6 @@ class WsRelayChannel(
         }
     }
 
-    /** 发送 PCM 音频帧（中继模式；Wi‑Fi 模式仍走 UDP） */
     fun sendAudioPcm(pcm: ByteArray) {
         val packet = ProtocolCodec.packAudio(seq.getAndIncrement(), pcm)
         audioSendQueue.offer(packet)
@@ -123,6 +142,10 @@ class WsRelayChannel(
         val base = relayBaseUrl.trim().trimEnd('/')
             .replaceFirst("^http://".toRegex(), "ws://")
             .replaceFirst("^https://".toRegex(), "wss://")
+        if (!base.startsWith("ws://") && !base.startsWith("wss://")) {
+            AppBus.log("中继地址无效: $relayBaseUrl", "E")
+            return false
+        }
         val roleStr = if (role == DeviceRole.HOST) "host" else "companion"
         val url = "$base/ws?room=${roomCode.uppercase()}&role=$roleStr"
         val latchOk = AtomicBoolean(false)
@@ -133,13 +156,15 @@ class WsRelayChannel(
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 socketRef.set(webSocket)
                 linked.set(true)
+                peerReady.set(false)
                 latchOk.set(true)
                 latchDone.set(true)
+                AppBus.clearLastError()
+                AppBus.log("中继 WSS 已开，等待对端入房… $url")
                 if (announceState) {
-                    AppBus.setConn(ConnState.CONNECTED, "relay:$roomCode")
+                    AppBus.setConn(ConnState.CONNECTING, "中继已开·等对端 $roomCode")
                 }
-                AppBus.log("中继已连接 $url")
-                onLinkChanged?.invoke(true)
+                onLinkChanged?.invoke(true, false)
                 enqueue(
                     Msg.Hello(
                         role = roleStr,
@@ -179,7 +204,7 @@ class WsRelayChannel(
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 if (text.contains("\"relay_status\"") || text.contains("\"relay_error\"")) {
-                    AppBus.log("中继: $text")
+                    handleRelayControl(text)
                     return
                 }
                 val msg = ProtocolCodec.decode(text) ?: return
@@ -204,7 +229,13 @@ class WsRelayChannel(
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                AppBus.log("中继失败: ${t.message}", "E")
+                val code = response?.code
+                val detail = buildString {
+                    append(t.message ?: t.javaClass.simpleName)
+                    if (code != null) append(" HTTP $code")
+                }
+                AppBus.log("中继失败: $detail", "E")
+                AppBus.setLastError("云中继: $detail")
                 socketRef.compareAndSet(webSocket, null)
                 latchDone.set(true)
             }
@@ -216,5 +247,38 @@ class WsRelayChannel(
             delay(50)
         }
         return latchOk.get() && socketRef.get() != null
+    }
+
+    private fun handleRelayControl(text: String) {
+        AppBus.log("中继: $text")
+        try {
+            val obj = JSONObject(text)
+            when (obj.optString("type")) {
+                "relay_status" -> {
+                    val ready = obj.optBoolean("ready", false)
+                    val was = peerReady.getAndSet(ready)
+                    if (ready && !was) {
+                        AppBus.log("对端已入房，云中继就绪")
+                        AppBus.clearLastError()
+                        if (announceState) {
+                            AppBus.setConn(ConnState.CONNECTED, "云中继 $roomCode")
+                        }
+                        onLinkChanged?.invoke(true, true)
+                    } else if (!ready && was) {
+                        AppBus.log("对端离开房间", "W")
+                        if (announceState) {
+                            AppBus.setConn(ConnState.CONNECTING, "中继已开·等对端 $roomCode")
+                        }
+                        onLinkChanged?.invoke(true, false)
+                    } else if (!ready && announceState && linked.get()) {
+                        AppBus.setConn(ConnState.CONNECTING, "中继已开·等对端 $roomCode")
+                    }
+                }
+                "relay_error" -> {
+                    AppBus.setLastError("云中继: ${obj.optString("error")}")
+                }
+            }
+        } catch (_: Exception) {
+        }
     }
 }

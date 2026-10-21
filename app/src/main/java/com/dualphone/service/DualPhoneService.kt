@@ -1,17 +1,20 @@
 /**
- * 前台服务：按连接模式持有 TCP/UDP（局域网）或 WSS 中继；
- * 自动模式优先局域网，不可用时切云中继；来电监听与消息分发。
+ * 前台服务：局域网 TCP/UDP 与云中继 WSS；自动优先局域网。
+ * Android 14+ 默认仅以 dataSync 类型拉起，避免无录音权限时 FGS 崩溃。
  */
 package com.dualphone.service
 
+import android.Manifest
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.dualphone.call.BluetoothScoHelper
 import com.dualphone.call.CallController
 import com.dualphone.call.CallStateMonitor
@@ -24,6 +27,8 @@ import com.dualphone.common.ConnMode
 import com.dualphone.common.ConnState
 import com.dualphone.common.DeviceRole
 import com.dualphone.common.Msg
+import com.dualphone.common.NetUtil
+import com.dualphone.common.RelayDefaults
 import com.dualphone.network.RelayAudioBridge
 import com.dualphone.network.TcpControlChannel
 import com.dualphone.network.UdpAudioChannel
@@ -65,7 +70,7 @@ class DualPhoneService : Service() {
         prefs = AppPrefs(this)
         CompanionNotifier.ensureChannels(this)
         startAsForeground()
-        AppBus.log("DualPhoneService 已启动")
+        AppBus.log("DualPhoneService 已启动 ip=${NetUtil.localIpv4(this)}")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -96,7 +101,6 @@ class DualPhoneService : Service() {
             ConnMode.LAN -> tcp?.enqueue(msg, reliable = reliable)
             ConnMode.RELAY -> relay?.enqueue(msg, reliable = reliable)
             ConnMode.AUTO -> {
-                // 优先局域网；否则中继；都未连则两边都入队，连上后发出
                 val lanOk = tcp?.isConnected() == true
                 val relayOk = relay?.isConnected() == true
                 when {
@@ -116,7 +120,7 @@ class DualPhoneService : Service() {
         val role = prefs.role
         when (prefs.connMode) {
             ConnMode.RELAY -> {
-                startRelay(role, announce = true)
+                if (!startRelay(role, announce = true)) return
                 activePath.set(ActivePath.RELAY)
             }
             ConnMode.LAN -> {
@@ -144,15 +148,20 @@ class DualPhoneService : Service() {
         refreshForeground()
     }
 
-    /** 自动：Host 同时开局域网+中继；Companion 先试局域网再回落中继 */
     private fun startAuto(role: DeviceRole) {
-        prefs.ensurePairingCode()
-        AppBus.log("自动模式：优先局域网，不可用时用云中继（配对码 ${prefs.pairingCode}）")
+        val code = prefs.ensurePairingCodeForRole()
+        if (code == null) {
+            AppBus.setLastError("请先填写与转发端相同的 6 位配对码")
+            AppBus.setConn(ConnState.DISCONNECTED)
+            AppBus.log("自动模式中止：接收端没有配对码", "E")
+            return
+        }
+        AppBus.log("自动模式：局域网优先，失败改云中继（配对码 $code）")
         if (role == DeviceRole.HOST) {
-            // Host：局域网监听 + 中继挂房，伴侣从哪边来都能接
             startLan(role, announce = false)
             startRelay(role, announce = false)
             activePath.set(ActivePath.NONE)
+            monitorHostPaths()
             refreshAutoConnState()
         } else {
             autoJob = scope.launch(Dispatchers.IO) {
@@ -165,14 +174,12 @@ class DualPhoneService : Service() {
                         activePath.set(ActivePath.LAN)
                         AppBus.log("自动模式：已走局域网")
                         refreshAutoConnState()
-                        // 局域网掉线后自动切中继；同时后台可再升回局域网
                         monitorCompanionFailoverAndUpgrade()
                         return@launch
                     }
                     delay(200)
                 }
                 AppBus.log("自动模式：局域网未连通，改用云中继")
-                // 保留 TCP+discovery 后台重试，便于稍后自动升回局域网
                 startRelay(role, announce = false)
                 activePath.set(ActivePath.RELAY)
                 refreshAutoConnState()
@@ -181,7 +188,16 @@ class DualPhoneService : Service() {
         }
     }
 
-    /** Companion：LAN 断 → 中继；中继时若 LAN 通 → 升回局域网 */
+    private fun monitorHostPaths() {
+        if (monitorJob?.isActive == true) return
+        monitorJob = scope.launch(Dispatchers.IO) {
+            while (isActive) {
+                delay(800)
+                refreshAutoConnState()
+            }
+        }
+    }
+
     private fun monitorCompanionFailoverAndUpgrade() {
         if (monitorJob?.isActive == true) return
         monitorJob = scope.launch(Dispatchers.IO) {
@@ -197,11 +213,8 @@ class DualPhoneService : Service() {
                             AppBus.log("自动模式：局域网断开，宽限后切中继…", "W")
                             delay(AutoConnect.LAN_FAILOVER_GRACE_MS)
                             if (tcp?.isConnected() == true) continue
-                            if (relay == null) {
-                                startRelay(prefs.role, announce = false)
-                            }
-                            // 等中继连上
-                            val until = System.currentTimeMillis() + 20_000
+                            if (relay == null) startRelay(prefs.role, announce = false)
+                            val until = System.currentTimeMillis() + 25_000
                             while (isActive && System.currentTimeMillis() < until &&
                                 relay?.isConnected() != true
                             ) {
@@ -211,19 +224,16 @@ class DualPhoneService : Service() {
                                 activePath.set(ActivePath.RELAY)
                                 AppBus.log("自动模式：已切换到云中继")
                                 refreshAutoConnState()
-                                // 保留/重启 discovery，便于升回
                                 if (discovery == null) startDiscoveryOnly(prefs.role)
                             }
                         }
                     }
                     ActivePath.RELAY -> {
-                        // 尝试升回局域网
                         if (lanOk) {
                             activePath.set(ActivePath.LAN)
                             AppBus.log("自动模式：局域网恢复，切回局域网")
                             refreshAutoConnState()
                         } else {
-                            // 确保 TCP/discovery 在尝试
                             val peer = prefs.peerIp
                             if (tcp == null && peer.isNotBlank()) {
                                 startLan(prefs.role, announce = false)
@@ -255,40 +265,26 @@ class DualPhoneService : Service() {
         if (prefs.connMode != ConnMode.AUTO) return
         val lanOk = tcp?.isConnected() == true
         val relayOk = relay?.isConnected() == true
+        val relayLinked = relay?.isLinked() == true
         when {
             lanOk -> {
-                activePath.compareAndSet(ActivePath.NONE, ActivePath.LAN)
-                if (activePath.get() == ActivePath.LAN || prefs.role == DeviceRole.HOST) {
-                    // Host 双挂时优先显示局域网
-                    if (lanOk && (activePath.get() == ActivePath.LAN || prefs.role == DeviceRole.HOST)) {
-                        if (prefs.role == DeviceRole.HOST && lanOk) {
-                            activePath.set(ActivePath.LAN)
-                        }
-                        AppBus.setConn(ConnState.CONNECTED, "局域网 ${tcp?.currentPeer() ?: prefs.peerIp}")
-                    }
-                }
+                activePath.set(ActivePath.LAN)
+                AppBus.setConn(ConnState.CONNECTED, "已连接（局域网） ${tcp?.currentPeer() ?: prefs.peerIp}")
             }
             relayOk -> {
-                if (activePath.get() != ActivePath.LAN) {
-                    activePath.compareAndSet(ActivePath.NONE, ActivePath.RELAY)
-                    AppBus.setConn(ConnState.CONNECTED, "云中继 ${prefs.pairingCode}")
-                }
+                activePath.set(ActivePath.RELAY)
+                AppBus.setConn(ConnState.CONNECTED, "已连接（云中继） ${prefs.pairingCode}")
             }
-            discovery != null && prefs.role == DeviceRole.COMPANION -> {
-                AppBus.setConn(ConnState.DISCOVERING)
+            relayLinked -> {
+                AppBus.setConn(ConnState.CONNECTING, "中继已开·等对端 ${prefs.pairingCode}")
+            }
+            discovery != null && prefs.role == DeviceRole.COMPANION && tcp != null -> {
+                AppBus.setConn(ConnState.DISCOVERING, "正在找转发端…")
             }
             tcp != null || relay != null -> {
                 AppBus.setConn(ConnState.CONNECTING)
             }
             else -> AppBus.setConn(ConnState.DISCONNECTED)
-        }
-        // Host：两边任一通就算已连接，优先标局域网
-        if (prefs.role == DeviceRole.HOST) {
-            when {
-                lanOk -> AppBus.setConn(ConnState.CONNECTED, "局域网 ${tcp?.currentPeer() ?: ""}")
-                relayOk -> AppBus.setConn(ConnState.CONNECTED, "云中继 ${prefs.pairingCode}")
-                else -> AppBus.setConn(ConnState.CONNECTING)
-            }
         }
         refreshForeground()
     }
@@ -318,7 +314,14 @@ class DualPhoneService : Service() {
 
     private fun startDiscoveryOnly(role: DeviceRole) {
         if (discovery != null) return
-        discovery = UdpDiscovery(scope, role, prefs.deviceName) { ip, _ ->
+        val code = prefs.pairingCode
+        discovery = UdpDiscovery(
+            context = this,
+            scope = scope,
+            role = role,
+            deviceName = prefs.deviceName,
+            pairingCode = code,
+        ) { ip, _ ->
             if (prefs.peerIp.isBlank() || role == DeviceRole.COMPANION) {
                 prefs.peerIp = ip
             }
@@ -326,20 +329,17 @@ class DualPhoneService : Service() {
         }.also { it.start() }
     }
 
-    private fun stopTcpOnly() {
-        tcp?.stop()
-        tcp = null
-    }
-
-    private fun startRelay(role: DeviceRole, announce: Boolean) {
-        if (relay != null) return
-        val url = prefs.relayUrl.trim()
-        if (url.isBlank()) {
-            AppBus.log("中继地址为空：请填写 Worker URL", "E")
+    /** @return false 若因配对码缺失未启动 */
+    private fun startRelay(role: DeviceRole, announce: Boolean): Boolean {
+        if (relay != null) return true
+        val url = prefs.relayUrl.trim().ifBlank { RelayDefaults.DEFAULT_URL }
+        val code = prefs.ensurePairingCodeForRole()
+        if (code == null) {
+            AppBus.setLastError("请先填写与转发端相同的 6 位配对码")
+            AppBus.log("云中继未启动：接收端缺少配对码", "E")
             if (announce) AppBus.setConn(ConnState.DISCONNECTED)
-            return
+            return false
         }
-        val code = prefs.ensurePairingCode()
         AppBus.log("云中继 url=$url room=$code")
         relay = WsRelayChannel(
             scope = scope,
@@ -350,12 +350,13 @@ class DualPhoneService : Service() {
             onMessage = { handleIncoming(it) },
             onAudioFrame = { data -> relayAudio?.onRemotePacket(data) },
             announceState = announce,
-            onLinkChanged = {
+            onLinkChanged = { _, _ ->
                 if (prefs.connMode == ConnMode.AUTO) {
                     scope.launch { refreshAutoConnState() }
                 }
             },
         ).also { it.start() }
+        return true
     }
 
     private fun startAudio() {
@@ -437,6 +438,25 @@ class DualPhoneService : Service() {
         ConnMode.RELAY -> "仅云中继 ${prefs.pairingCode}"
     }
 
+    private fun roleLabel(): String =
+        if (prefs.role == DeviceRole.HOST) "转发端" else "接收端"
+
+    private fun foregroundTypes(): Int {
+        var t = 0
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // 默认只用 dataSync，避免无 RECORD_AUDIO 时 startForeground 直接崩
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                t = t or ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            }
+            val mic = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED
+            if (mic) {
+                t = t or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            }
+        }
+        return t
+    }
+
     private fun startAsForeground() {
         CompanionNotifier.ensureChannels(this)
         val pi = PendingIntent.getActivity(
@@ -445,28 +465,29 @@ class DualPhoneService : Service() {
         )
         val n = NotificationCompat.Builder(this, CompanionNotifier.CHANNEL_SERVICE)
             .setContentTitle("DualPhone 运行中")
-            .setContentText(
-                (if (prefs.role == DeviceRole.HOST) "主机" else "伴侣") + " · " + modeLabel(),
-            )
+            .setContentText("${roleLabel()} · ${modeLabel()}")
             .setSmallIcon(android.R.drawable.ic_menu_share)
             .setContentIntent(pi)
             .setOngoing(true)
             .build()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(
-                1001, n,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
-            )
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                1001, n,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
-            )
-        } else {
-            startForeground(1001, n)
+        try {
+            val types = foregroundTypes()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && types != 0) {
+                startForeground(1001, n, types)
+            } else {
+                startForeground(1001, n)
+            }
+        } catch (e: Exception) {
+            AppBus.log("前台服务启动降级: ${e.message}", "W")
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    startForeground(1001, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                } else {
+                    startForeground(1001, n)
+                }
+            } catch (e2: Exception) {
+                AppBus.setLastError("无法启动前台服务: ${e2.message}")
+            }
         }
     }
 
@@ -522,18 +543,21 @@ class DualPhoneService : Service() {
         private var instance: DualPhoneService? = null
 
         fun start(context: Context) {
-            val i = Intent(context, DualPhoneService::class.java)
-            ContextCompatStart(context, i)
+            ContextCompatStart(context, Intent(context, DualPhoneService::class.java))
         }
 
         fun stop(context: Context) {
-            val i = Intent(context, DualPhoneService::class.java).setAction(ACTION_STOP)
-            ContextCompatStart(context, i)
+            ContextCompatStart(
+                context,
+                Intent(context, DualPhoneService::class.java).setAction(ACTION_STOP),
+            )
         }
 
         fun restart(context: Context) {
-            val i = Intent(context, DualPhoneService::class.java).setAction(ACTION_RESTART)
-            ContextCompatStart(context, i)
+            ContextCompatStart(
+                context,
+                Intent(context, DualPhoneService::class.java).setAction(ACTION_RESTART),
+            )
         }
 
         fun enqueue(context: Context, msg: Msg, reliable: Boolean = false) {
