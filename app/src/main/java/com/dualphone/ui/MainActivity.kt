@@ -1,6 +1,5 @@
 /**
- * 主界面：选择 Host/Companion 角色，开关功能，连接状态与日志；
- * Companion 另有通知列表入口。动态申请权限并跳转系统设置。
+ * 主界面：Host/Companion、局域网 / 云中继、功能开关、连接状态与日志。
  */
 package com.dualphone.ui
 
@@ -50,6 +49,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.app.NotificationManagerCompat
 import com.dualphone.common.AppBus
 import com.dualphone.common.AppPrefs
+import com.dualphone.common.ConnMode
 import com.dualphone.common.ConnState
 import com.dualphone.common.DeviceRole
 import com.dualphone.service.DualPhoneService
@@ -72,7 +72,10 @@ fun DualPhoneScreen() {
     val context = LocalContext.current
     val prefs = remember { AppPrefs(context) }
     var role by remember { mutableStateOf(prefs.role) }
+    var connMode by remember { mutableStateOf(prefs.connMode) }
     var peerIp by remember { mutableStateOf(prefs.peerIp) }
+    var pairingCode by remember { mutableStateOf(prefs.pairingCode) }
+    var relayUrl by remember { mutableStateOf(prefs.relayUrl) }
     var deviceName by remember { mutableStateOf(prefs.deviceName) }
     var enableSms by remember { mutableStateOf(prefs.enableSms) }
     var enableCall by remember { mutableStateOf(prefs.enableCall) }
@@ -147,6 +150,36 @@ fun DualPhoneScreen() {
                 }
             }
             item {
+                Text("连接方式", style = MaterialTheme.typography.titleMedium)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = connMode == ConnMode.LAN,
+                        onClick = {
+                            connMode = ConnMode.LAN
+                            prefs.connMode = connMode
+                        },
+                        label = { Text("同一 Wi‑Fi") },
+                    )
+                    FilterChip(
+                        selected = connMode == ConnMode.RELAY,
+                        onClick = {
+                            connMode = ConnMode.RELAY
+                            prefs.connMode = connMode
+                        },
+                        label = { Text("云中继（流量可用）") },
+                    )
+                }
+                Text(
+                    when (connMode) {
+                        ConnMode.LAN -> "两台同一局域网；也可开热点（一方开热点另一方连上，仍走本机流量）。"
+                        ConnMode.RELAY -> "双方输入相同配对码，经云端 WSS 转发；延迟更高，通话可能 >500ms。"
+                    },
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.outline,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+            }
+            item {
                 OutlinedTextField(
                     value = deviceName,
                     onValueChange = {
@@ -156,19 +189,53 @@ fun DualPhoneScreen() {
                     label = { Text("本机名称") },
                     modifier = Modifier.fillMaxWidth(),
                 )
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = peerIp,
-                    onValueChange = {
-                        peerIp = it
-                        prefs.peerIp = it
-                    },
-                    label = { Text("对端 IP（可空=自动发现）") },
-                    modifier = Modifier.fillMaxWidth(),
-                    supportingText = {
-                        Text("TCP ${com.dualphone.common.Ports.TCP_CONTROL} / UDP 音频 ${com.dualphone.common.Ports.UDP_AUDIO}")
-                    },
-                )
+            }
+            if (connMode == ConnMode.LAN) {
+                item {
+                    OutlinedTextField(
+                        value = peerIp,
+                        onValueChange = {
+                            peerIp = it
+                            prefs.peerIp = it
+                        },
+                        label = { Text("对端 IP（可空=自动发现）") },
+                        modifier = Modifier.fillMaxWidth(),
+                        supportingText = {
+                            Text("TCP ${com.dualphone.common.Ports.TCP_CONTROL} / UDP 音频 ${com.dualphone.common.Ports.UDP_AUDIO}")
+                        },
+                    )
+                }
+            } else {
+                item {
+                    OutlinedTextField(
+                        value = pairingCode,
+                        onValueChange = {
+                            pairingCode = it.uppercase().filter { c -> c.isLetterOrDigit() }.take(6)
+                            prefs.pairingCode = pairingCode
+                        },
+                        label = { Text("配对码（6 位）") },
+                        modifier = Modifier.fillMaxWidth(),
+                        supportingText = { Text("两台手机填同一个码；主机可点「生成」") },
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = {
+                            val code = prefs.generatePairingCode()
+                            pairingCode = code
+                        }) { Text("生成配对码") }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = relayUrl,
+                        onValueChange = {
+                            relayUrl = it
+                            prefs.relayUrl = it
+                        },
+                        label = { Text("中继地址") },
+                        modifier = Modifier.fillMaxWidth(),
+                        supportingText = { Text("部署 relay/ 后填 https://….workers.dev；勿带末尾斜杠") },
+                    )
+                }
             }
             item {
                 Card(Modifier.fillMaxWidth()) {
@@ -177,6 +244,9 @@ fun DualPhoneScreen() {
                             "连接: ${connLabel(conn)}" + (peer?.let { " · $it" } ?: ""),
                             style = MaterialTheme.typography.titleSmall,
                         )
+                        if (connMode == ConnMode.RELAY && pairingCode.isNotBlank()) {
+                            Text("配对码 $pairingCode", fontSize = 13.sp)
+                        }
                     }
                 }
             }
@@ -246,8 +316,14 @@ fun DualPhoneScreen() {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = {
                         prefs.role = role
+                        prefs.connMode = connMode
                         prefs.peerIp = peerIp
-                        DualPhoneService.start(context)
+                        prefs.pairingCode = pairingCode
+                        prefs.relayUrl = relayUrl
+                        if (connMode == ConnMode.RELAY && prefs.pairingCode.length != 6) {
+                            pairingCode = prefs.generatePairingCode()
+                        }
+                        DualPhoneService.restart(context)
                     }) { Text("启动服务") }
                     Button(onClick = { DualPhoneService.stop(context) }) { Text("停止") }
                 }

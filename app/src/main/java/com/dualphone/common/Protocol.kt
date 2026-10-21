@@ -13,6 +13,14 @@ import java.util.UUID
 /** 设备角色：Host=手机 A（有 SIM），Companion=手机 B（镜像端） */
 enum class DeviceRole { HOST, COMPANION }
 
+/** 连接方式：局域网 TCP/UDP，或云中继 WSS（流量可用） */
+enum class ConnMode { LAN, RELAY }
+
+object RelayDefaults {
+    /** 部署后的默认 Worker 基址（可在设置里改） */
+    const val DEFAULT_URL = ""  // 部署 relay/ 后填入 https://dualphone-relay.<subdomain>.workers.dev
+}
+
 object Ports {
     const val TCP_CONTROL = 37210
     const val UDP_AUDIO = 37211
@@ -184,4 +192,7 @@ object Prefs {
     const val KEY_CALL = "enable_call"
     const val KEY_NOTIF = "enable_notif"
     const val KEY_AUTO_ANSWER = "auto_answer"
+    const val KEY_CONN_MODE = "conn_mode"
+    const val KEY_PAIRING_CODE = "pairing_code"
+    const val KEY_RELAY_URL = "relay_url"
 }

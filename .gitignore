@@ -15,3 +15,7 @@
 *.class
 *.apk
 .kotlin/
+relay/node_modules/
+relay/.cache/
+dist/
+app/build/
