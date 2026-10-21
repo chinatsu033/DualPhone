@@ -9,7 +9,7 @@ cd relay
 npx wrangler deploy
 ```
 
-需要 Cloudflare 账号，且 API token 具备 Workers / Durable Objects 写权限。部署后得到 `https://dualphone-relay.<subdomain>.workers.dev`。
+需要 Cloudflare 账号，且 API token 具备 Workers / Durable Objects 写权限。当前已部署：`https://dualphone-relay.chinatsumar33.workers.dev`。
 
 ## 协议
 

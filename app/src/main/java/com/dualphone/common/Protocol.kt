@@ -18,7 +18,7 @@ enum class ConnMode { LAN, RELAY }
 
 object RelayDefaults {
     /** 部署后的默认 Worker 基址（可在设置里改） */
-    const val DEFAULT_URL = ""  // 部署 relay/ 后填入 https://dualphone-relay.<subdomain>.workers.dev
+    const val DEFAULT_URL = "https://dualphone-relay.chinatsumar33.workers.dev"
 }
 
 object Ports {

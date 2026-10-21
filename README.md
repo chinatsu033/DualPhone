@@ -20,7 +20,7 @@
 2. 连接方式选 **云中继（流量可用）**。
 3. Host 点「生成配对码」，把 6 位码填到 Companion（或口播）。
 4. 两边都点「启动服务」；状态变为已连接且日志出现 `relay_status … ready:true` 即可。
-5. 在「中继地址」填入你部署的 Worker（见 [`relay/`](relay/)）。仓库未附带长期公共中继：本机 CI token 无 Workers 写权限，需你在 Cloudflare 上 `cd relay && npx wrangler deploy` 一次。
+5. 「中继地址」填：`https://dualphone-relay.chinatsumar33.workers.dev`（已部署到你的 Cloudflare 帐户）。
 
 **延迟预期：** 控制消息通常可接受；通话音频经中继往返，**经常超过 500ms**，视运营商与 Worker 区域而定。中继会看到明文控制 JSON 与音频帧，请只用于自己的设备。
 
@@ -80,7 +80,7 @@ cd relay
 npx wrangler deploy
 ```
 
-把 App 里「中继地址」改成你的 `https://dualphone-relay.<subdomain>.workers.dev`。详见 [`relay/README.md`](relay/README.md)。
+App 里「中继地址」填：`https://dualphone-relay.chinatsumar33.workers.dev`。详见 [`relay/README.md`](relay/README.md)。
 
 ## 权限说明
 
