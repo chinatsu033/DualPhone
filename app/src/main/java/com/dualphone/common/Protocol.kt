@@ -13,8 +13,12 @@ import java.util.UUID
 /** 设备角色：Host=手机 A（有 SIM），Companion=手机 B（镜像端） */
 enum class DeviceRole { HOST, COMPANION }
 
-/** 连接方式：局域网 TCP/UDP，或云中继 WSS（流量可用） */
-enum class ConnMode { LAN, RELAY }
+/**
+ * 连接方式：
+ * AUTO=优先局域网，不可用时自动改云中继；
+ * LAN=仅局域网；RELAY=仅云中继。
+ */
+enum class ConnMode { AUTO, LAN, RELAY }
 
 object RelayDefaults {
     /** 部署后的默认 Worker 基址（可在设置里改） */
@@ -36,6 +40,13 @@ object AudioFormat {
     const val FRAME_BYTES = FRAME_SAMPLES * 2
     const val MAGIC: Int = 0x44504155 // "DPAU"
     const val HEADER_SIZE = 12 // magic(4) + seq(4) + len(4)
+}
+
+/** 局域网探测等待时长（Companion 自动模式） */
+object AutoConnect {
+    const val LAN_TRY_MS = 5_000L
+    const val LAN_FAILOVER_GRACE_MS = 3_000L
+    const val LAN_UPGRADE_INTERVAL_MS = 8_000L
 }
 
 /** 协议消息基类字段 */
@@ -181,6 +192,9 @@ object ProtocolCodec {
 
 /** 连接状态 */
 enum class ConnState { DISCONNECTED, DISCOVERING, CONNECTING, CONNECTED, RECONNECTING }
+
+/** 当前实际走的传输（自动模式用） */
+enum class ActivePath { NONE, LAN, RELAY }
 
 /** 应用偏好键 */
 object Prefs {

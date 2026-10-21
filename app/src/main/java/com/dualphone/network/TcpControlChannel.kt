@@ -33,8 +33,12 @@ class TcpControlChannel(
     private val role: DeviceRole,
     private val deviceName: String,
     private val onMessage: (Msg) -> Unit,
+    /** 为 false 时不直接改 AppBus 连接态（由自动模式统一汇报） */
+    private val announceState: Boolean = true,
+    private val onLinkChanged: ((connected: Boolean, peer: String?) -> Unit)? = null,
 ) {
     private val running = AtomicBoolean(false)
+    private val linked = AtomicBoolean(false)
     private val sendQueue = ConcurrentLinkedQueue<String>()
     private val replayQueue = ConcurrentLinkedQueue<String>()
     private val writeMutex = Mutex()
@@ -42,24 +46,45 @@ class TcpControlChannel(
     private var writer: BufferedWriter? = null
     private var serverSocket: ServerSocket? = null
     private var loopJob: Job? = null
-    private var peerIp: String? = null
+    @Volatile private var peerIp: String? = null
+
+    fun isConnected(): Boolean = linked.get()
+
+    fun currentPeer(): String? = peerIp
+
+    /** Companion 发现到 Host IP 后动态更新，供重连使用 */
+    fun setPeerIp(ip: String) {
+        if (ip.isBlank()) return
+        peerIp = ip
+        AppBus.log("TCP 对端 IP → $ip")
+    }
 
     fun start(manualPeerIp: String? = null) {
         if (!running.compareAndSet(false, true)) return
-        peerIp = manualPeerIp?.takeIf { it.isNotBlank() }
+        if (!manualPeerIp.isNullOrBlank()) peerIp = manualPeerIp
         loopJob = scope.launch(Dispatchers.IO) {
             var backoff = 1000L
             while (isActive && running.get()) {
                 try {
-                    AppBus.setConn(if (backoff > 1000) ConnState.RECONNECTING else ConnState.CONNECTING, peerIp)
+                    if (announceState) {
+                        AppBus.setConn(
+                            if (backoff > 1000) ConnState.RECONNECTING else ConnState.CONNECTING,
+                            peerIp,
+                        )
+                    }
                     AppBus.log("TCP 连接中… role=$role peer=$peerIp")
                     val sock = if (role == DeviceRole.HOST) acceptClient() else connectClient()
                     socket = sock
                     writer = BufferedWriter(OutputStreamWriter(sock.getOutputStream(), Charsets.UTF_8))
-                    AppBus.setConn(ConnState.CONNECTED, sock.inetAddress?.hostAddress ?: peerIp)
+                    linked.set(true)
+                    val peerAddr = sock.inetAddress?.hostAddress ?: peerIp
+                    peerIp = peerAddr
+                    if (announceState) {
+                        AppBus.setConn(ConnState.CONNECTED, peerAddr)
+                    }
                     AppBus.log("TCP 已连接 ${sock.remoteSocketAddress}")
+                    onLinkChanged?.invoke(true, peerAddr)
                     backoff = 1000L
-                    // hello + 重放队列
                     sendNow(
                         Msg.Hello(
                             role = if (role == DeviceRole.HOST) "host" else "companion",
@@ -67,7 +92,6 @@ class TcpControlChannel(
                         ),
                     )
                     flushReplay()
-                    // 读写循环
                     val reader = BufferedReader(InputStreamReader(sock.getInputStream(), Charsets.UTF_8))
                     val writerJob = launch {
                         while (isActive && running.get() && sock.isConnected) {
@@ -106,11 +130,13 @@ class TcpControlChannel(
                 } catch (e: Exception) {
                     AppBus.log("TCP 断开: ${e.message}", "W")
                 } finally {
+                    val was = linked.getAndSet(false)
                     closeQuietly()
-                    AppBus.setConn(ConnState.DISCONNECTED)
+                    if (was) onLinkChanged?.invoke(false, peerIp)
+                    if (announceState) AppBus.setConn(ConnState.DISCONNECTED)
                 }
                 if (!running.get()) break
-                AppBus.setConn(ConnState.RECONNECTING)
+                if (announceState) AppBus.setConn(ConnState.RECONNECTING)
                 delay(backoff)
                 backoff = (backoff * 2).coerceAtMost(30_000L)
             }
@@ -120,8 +146,10 @@ class TcpControlChannel(
     fun stop() {
         running.set(false)
         loopJob?.cancel()
+        val was = linked.getAndSet(false)
         closeQuietly()
-        AppBus.setConn(ConnState.DISCONNECTED)
+        if (was) onLinkChanged?.invoke(false, peerIp)
+        if (announceState) AppBus.setConn(ConnState.DISCONNECTED)
     }
 
     /** 入队发送；重要消息同时进重放队列（断线后补发） */
@@ -180,7 +208,7 @@ class TcpControlChannel(
         val ip = peerIp ?: throw IllegalStateException("Companion 需要 peer IP")
         val sock = Socket()
         sock.tcpNoDelay = true
-        sock.connect(InetSocketAddress(ip, Ports.TCP_CONTROL), 10_000)
+        sock.connect(InetSocketAddress(ip, Ports.TCP_CONTROL), 8_000)
         return sock
     }
 

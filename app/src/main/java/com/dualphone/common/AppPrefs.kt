@@ -44,7 +44,11 @@ class AppPrefs(context: Context) {
         set(v) = sp.edit().putBoolean(Prefs.KEY_AUTO_ANSWER, v).apply()
 
     var connMode: ConnMode
-        get() = if (sp.getString(Prefs.KEY_CONN_MODE, "LAN") == "RELAY") ConnMode.RELAY else ConnMode.LAN
+        get() = when (sp.getString(Prefs.KEY_CONN_MODE, "AUTO")) {
+            "RELAY" -> ConnMode.RELAY
+            "LAN" -> ConnMode.LAN
+            else -> ConnMode.AUTO
+        }
         set(v) = sp.edit().putString(Prefs.KEY_CONN_MODE, v.name).apply()
 
     var pairingCode: String
@@ -66,5 +70,11 @@ class AppPrefs(context: Context) {
         }
         pairingCode = code
         return code
+    }
+
+    /** 确保有 6 位配对码（自动/中继模式需要） */
+    fun ensurePairingCode(): String {
+        if (pairingCode.length == 6) return pairingCode
+        return generatePairingCode()
     }
 }

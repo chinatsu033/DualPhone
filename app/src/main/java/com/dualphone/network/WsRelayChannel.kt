@@ -37,8 +37,11 @@ class WsRelayChannel(
     private val roomCode: String,
     private val onMessage: (Msg) -> Unit,
     private val onAudioFrame: ((ByteArray) -> Unit)? = null,
+    private val announceState: Boolean = true,
+    private val onLinkChanged: ((connected: Boolean) -> Unit)? = null,
 ) {
     private val running = AtomicBoolean(false)
+    private val linked = AtomicBoolean(false)
     private val sendQueue = ConcurrentLinkedQueue<String>()
     private val replayQueue = ConcurrentLinkedQueue<String>()
     private val audioSendQueue = ConcurrentLinkedQueue<ByteArray>()
@@ -52,21 +55,24 @@ class WsRelayChannel(
         .connectTimeout(15, TimeUnit.SECONDS)
         .build()
 
+    fun isConnected(): Boolean = linked.get()
+
     fun start() {
         if (!running.compareAndSet(false, true)) return
         loopJob = scope.launch(Dispatchers.IO) {
             var backoff = 1000L
             while (isActive && running.get()) {
                 try {
-                    AppBus.setConn(
-                        if (backoff > 1000) ConnState.RECONNECTING else ConnState.CONNECTING,
-                        "relay:$roomCode",
-                    )
+                    if (announceState) {
+                        AppBus.setConn(
+                            if (backoff > 1000) ConnState.RECONNECTING else ConnState.CONNECTING,
+                            "relay:$roomCode",
+                        )
+                    }
                     AppBus.log("中继连接中… room=$roomCode role=$role")
                     val opened = connectOnce()
                     if (!opened) throw IllegalStateException("websocket open failed")
                     backoff = 1000L
-                    // 保持到断开
                     while (isActive && running.get() && socketRef.get() != null) {
                         delay(200)
                     }
@@ -75,10 +81,12 @@ class WsRelayChannel(
                 } finally {
                     writerJob?.cancel()
                     socketRef.getAndSet(null)?.cancel()
-                    AppBus.setConn(ConnState.DISCONNECTED)
+                    val was = linked.getAndSet(false)
+                    if (was) onLinkChanged?.invoke(false)
+                    if (announceState) AppBus.setConn(ConnState.DISCONNECTED)
                 }
                 if (!running.get()) break
-                AppBus.setConn(ConnState.RECONNECTING, "relay:$roomCode")
+                if (announceState) AppBus.setConn(ConnState.RECONNECTING, "relay:$roomCode")
                 delay(backoff)
                 backoff = (backoff * 2).coerceAtMost(30_000L)
             }
@@ -90,7 +98,9 @@ class WsRelayChannel(
         loopJob?.cancel()
         writerJob?.cancel()
         socketRef.getAndSet(null)?.close(1000, "stop")
-        AppBus.setConn(ConnState.DISCONNECTED)
+        val was = linked.getAndSet(false)
+        if (was) onLinkChanged?.invoke(false)
+        if (announceState) AppBus.setConn(ConnState.DISCONNECTED)
     }
 
     fun enqueue(msg: Msg, reliable: Boolean = false) {
@@ -122,17 +132,20 @@ class WsRelayChannel(
         val listener = object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 socketRef.set(webSocket)
+                linked.set(true)
                 latchOk.set(true)
                 latchDone.set(true)
-                AppBus.setConn(ConnState.CONNECTED, "relay:$roomCode")
+                if (announceState) {
+                    AppBus.setConn(ConnState.CONNECTED, "relay:$roomCode")
+                }
                 AppBus.log("中继已连接 $url")
+                onLinkChanged?.invoke(true)
                 enqueue(
                     Msg.Hello(
                         role = roleStr,
                         name = deviceName,
                     ),
                 )
-                // 重放
                 val items = mutableListOf<String>()
                 while (true) {
                     val x = replayQueue.poll() ?: break
@@ -165,7 +178,6 @@ class WsRelayChannel(
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                // 服务端状态
                 if (text.contains("\"relay_status\"") || text.contains("\"relay_error\"")) {
                     AppBus.log("中继: $text")
                     return
@@ -199,7 +211,6 @@ class WsRelayChannel(
         }
 
         client.newWebSocket(request, listener)
-        // 等待 open 或失败（最多 20s）
         val deadline = System.currentTimeMillis() + 20_000
         while (!latchDone.get() && System.currentTimeMillis() < deadline && running.get()) {
             delay(50)
