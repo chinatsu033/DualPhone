@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">DualPhone</string>
+    <string name="notif_listener_label">DualPhone 通知镜像</string>
+    <string name="permission_sms_rationale">用于在主机 A 接收并转发短信，以及代发回复。</string>
+    <string name="permission_phone_rationale">用于检测来电、接听与挂断。</string>
+    <string name="permission_audio_rationale">用于局域网双向通话音频流。</string>
+    <string name="permission_location_rationale">部分机型获取 Wi‑Fi 信息需要位置权限；不会上传位置。</string>
+</resources>
